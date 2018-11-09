@@ -12,6 +12,7 @@
  */
 package com.netflix.conductor.core.orchestration;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.netflix.conductor.common.metadata.events.EventExecution;
 import com.netflix.conductor.common.metadata.tasks.PollData;
 import com.netflix.conductor.common.metadata.tasks.Task;
@@ -19,6 +20,7 @@ import com.netflix.conductor.common.metadata.tasks.TaskExecLog;
 import com.netflix.conductor.common.run.SearchResult;
 import com.netflix.conductor.common.run.Workflow;
 import com.netflix.conductor.core.events.queue.Message;
+import com.netflix.conductor.core.execution.ApplicationException;
 import com.netflix.conductor.dao.ExecutionDAO;
 import com.netflix.conductor.dao.IndexDAO;
 import org.slf4j.Logger;
@@ -26,29 +28,93 @@ import org.slf4j.LoggerFactory;
 
 import javax.inject.Inject;
 import javax.inject.Singleton;
+import java.io.IOException;
+import java.util.LinkedList;
 import java.util.List;
 
 /**
- * Service to orchestrate the data access between the storage layers
+ * Service to orchestrate the data access from the {@link ExecutionDAO} and {@link IndexDAO} storage layers
  */
 @Singleton
 public class DataAccessor {
     private static final Logger LOGGER = LoggerFactory.getLogger(DataAccessor.class);
 
+    private static final String ARCHIVED_FIELD = "archived";
+    private static final String RAW_JSON_FIELD = "rawJSON";
+
     private final ExecutionDAO executionDAO;
     private final IndexDAO indexDAO;
+    private final ObjectMapper objectMapper;
 
     @Inject
-    public DataAccessor(ExecutionDAO executionDAO, IndexDAO indexDAO) {
+    public DataAccessor(ExecutionDAO executionDAO, IndexDAO indexDAO, ObjectMapper objectMapper) {
         this.executionDAO = executionDAO;
         this.indexDAO = indexDAO;
+        this.objectMapper = objectMapper;
     }
 
+    /**
+     * Fetches the {@link Workflow} object from the data store given the id.
+     * Attempts to fetch from {@link ExecutionDAO} first,
+     * if not found, attempts to fetch from {@link IndexDAO}.
+     *
+     * @param workflowId   the id of the workflow to be fetched
+     * @param includeTasks if true, fetches the {@link Task} data in the workflow.
+     * @return the {@link Workflow} object
+     * @throws ApplicationException if
+     *                              <ul>
+     *                              <li>no such {@link Workflow} is found</li>
+     *                              <li>parsing the {@link Workflow} object fails</li>
+     *                              </ul>
+     */
     public Workflow getWorkflowById(String workflowId, boolean includeTasks) {
-        return executionDAO.getWorkflow(workflowId, includeTasks);
+        Workflow workflow = executionDAO.getWorkflow(workflowId, includeTasks);
+        if (workflow == null) {
+            LOGGER.debug("Workflow {} not found in executionDAO, checking indexDAO", workflowId);
+            String json = indexDAO.get(workflowId, RAW_JSON_FIELD);
+            if (json == null) {
+                String errorMsg = String.format("No such workflow found by id: %s", workflowId);
+                LOGGER.error(errorMsg);
+                throw new ApplicationException(ApplicationException.Code.NOT_FOUND, errorMsg);
+            }
+
+            try {
+                workflow = objectMapper.readValue(json, Workflow.class);
+                if (!includeTasks) {
+                    workflow.getTasks().clear();
+                }
+            } catch (IOException e) {
+                String errorMsg = String.format("Error reading workflow: %s", workflowId);
+                LOGGER.error(errorMsg);
+                throw new ApplicationException(ApplicationException.Code.BACKEND_ERROR, errorMsg, e);
+            }
+        }
+        return workflow;
     }
 
+    /**
+     * Retrieve all workflow executions with the given correlationId
+     * Uses the {@link IndexDAO} to search across workflows if the {@link ExecutionDAO} cannot perform searches across workflows.
+     *
+     * @param correlationId the correlation id to be queried
+     * @param includeTasks  if true, fetches the {@link Task} data within the workflows
+     * @return the list of {@link Workflow} executions matching the correlationId
+     */
     public List<Workflow> getWorkflowsByCorrelationId(String correlationId, boolean includeTasks) {
+        if (!executionDAO.canSearchAcrossWorkflows()) {
+            List<Workflow> workflows = new LinkedList<>();
+            SearchResult<String> result = indexDAO.searchWorkflows("correlationId='" + correlationId + "'", "*", 0, 10000, null);
+            result.getResults().forEach(workflowId -> {
+                try {
+                    Workflow workflow = getWorkflowById(workflowId, includeTasks);
+                    workflows.add(workflow);
+                } catch (ApplicationException e) {
+                    //This might happen when the workflow archival failed and the workflow was removed from dynomite
+                    LOGGER.error("Error getting the workflowId: {}  for correlationId: {} from Dynomite/Archival", workflowId, correlationId, e);
+                }
+            });
+            return workflows;
+        }
         return executionDAO.getWorkflowsByCorrelationId(correlationId, includeTasks);
     }
 
@@ -68,20 +134,56 @@ public class DataAccessor {
         return executionDAO.getPendingWorkflowCount(workflowName);
     }
 
+    /**
+     * Creates a new workflow in the data store
+     *
+     * @param workflow the workflow to be created
+     * @return the id of the created workflow
+     */
     public String createWorkflow(Workflow workflow) {
-        return executionDAO.createWorkflow(workflow);
+        executionDAO.createWorkflow(workflow);
+        indexDAO.indexWorkflow(workflow);
+        return workflow.getWorkflowId();
     }
 
+    /**
+     * Updates the given workflow in the data store
+     *
+     * @param workflow the workflow tp be updated
+     * @return the id of the updated workflow
+     */
     public String updateWorkflow(Workflow workflow) {
-        return executionDAO.updateWorkflow(workflow);
+        executionDAO.updateWorkflow(workflow);
+        indexDAO.indexWorkflow(workflow);
+        return workflow.getWorkflowId();
     }
 
     public void removeFromPendingWorkflow(String workflowType, String workflowId) {
         executionDAO.removeFromPendingWorkflow(workflowType, workflowId);
     }
 
+    /**
+     * Removes the workflow from the data store.
+     *
+     * @param workflowId the id of the workflow to be removed
+     * @param archiveWorkflow if true, the workflow will be archived in the {@link IndexDAO} after removal from  {@link ExecutionDAO}
+     */
     public void removeWorkflow(String workflowId, boolean archiveWorkflow) {
-        executionDAO.removeWorkflow(workflowId, archiveWorkflow);
+        try {
+            Workflow workflow = getWorkflowById(workflowId, true);
+            executionDAO.removeWorkflow(workflowId, archiveWorkflow);
+            if (archiveWorkflow) {
+                //Add to elasticsearch
+                indexDAO.updateWorkflow(workflowId,
+                        new String[]{RAW_JSON_FIELD, ARCHIVED_FIELD},
+                        new Object[]{objectMapper.writeValueAsString(workflow), true});
+            } else {
+                // Not archiving, also remove workflowId from index
+                indexDAO.removeWorkflow(workflowId);
+            }
+        } catch (Exception e) {
+            throw new ApplicationException(ApplicationException.Code.BACKEND_ERROR, "Error removing workflow: " + workflowId, e);
+        }
     }
 
     public List<Task> createTasks(List<Task> tasks) {
@@ -108,20 +210,31 @@ public class DataAccessor {
         return executionDAO.getInProgressTaskCount(taskDefName);
     }
 
+    /**
+     * Sets the update time for the task.
+     * Sets the end time for the task (if task is in terminal state and end time is not set).
+     * Updates the task in the {@link ExecutionDAO} first, then stores it in the {@link IndexDAO}.
+     *
+     * @param task the task to be updated in the data store
+     * @throws ApplicationException if the dao operations fail
+     */
     public void updateTask(Task task) {
-        executionDAO.updateTask(task);
+        try {
+            executionDAO.updateTask(task);
+            indexDAO.indexTask(task);
+        } catch (Exception e) {
+            String errorMsg = String.format("Error updating task: %s in workflow: %s", task.getTaskId(), task.getWorkflowInstanceId());
+            LOGGER.error(errorMsg, e);
+            throw new ApplicationException(ApplicationException.Code.BACKEND_ERROR, errorMsg, e);
+        }
     }
 
     public void updateTasks(List<Task> tasks) {
-        executionDAO.updateTasks(tasks);
+        tasks.forEach(this::updateTask);
     }
 
     public void removeTask(String taskId) {
         executionDAO.removeTask(taskId);
-    }
-
-    public void addTaskExecLog(List<TaskExecLog> logs) {
-        executionDAO.addTaskExecLog(logs);
     }
 
     public List<PollData> getTaskPollData(String taskName) {
@@ -136,20 +249,28 @@ public class DataAccessor {
         executionDAO.updateLastPoll(taskName, domain, workerId);
     }
 
+    /**
+     * Save the {@link EventExecution} to the data store
+     * Saves to {@link ExecutionDAO} first, if this succeeds then saves to the {@link IndexDAO}.
+     *
+     * @param eventExecution the {@link EventExecution} to be saved
+     * @return true if save succeeds, false otherwise.
+     */
     public boolean addEventExecution(EventExecution eventExecution) {
-        return executionDAO.addEventExecution(eventExecution);
+        boolean added = executionDAO.addEventExecution(eventExecution);
+        if (added) {
+            indexDAO.addEventExecution(eventExecution);
+        }
+        return added;
     }
 
     public void updateEventExecution(EventExecution eventExecution) {
         executionDAO.updateEventExecution(eventExecution);
+        indexDAO.addEventExecution(eventExecution);
     }
 
     public void removeEventExecution(EventExecution eventExecution) {
         executionDAO.removeEventExecution(eventExecution);
-    }
-
-    public void addMessage(String queue, Message message) {
-        executionDAO.addMessage(queue, message);
     }
 
     public boolean exceedsInProgressLimit(Task task) {
@@ -158,6 +279,14 @@ public class DataAccessor {
 
     public boolean exceedsRateLimitPerFrequency(Task task) {
         return executionDAO.exceedsRateLimitPerFrequency(task);
+    }
+
+    public void addTaskExecLog(List<TaskExecLog> logs) {
+        indexDAO.addTaskExecutionLogs(logs);
+    }
+
+    public void addMessage(String queue, Message message) {
+        indexDAO.addMessage(queue, message);
     }
 
     public SearchResult<String> searchWorkflows(String query, String freeText, int start, int count, List<String> sort) {
