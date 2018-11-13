@@ -1,8 +1,4 @@
-package com.netflix.conductor.common.metadata.tasks;
-
-import com.github.vmg.protogen.annotations.*;
-
-/**
+/*
  * Copyright 2016 Netflix, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,18 +13,27 @@ import com.github.vmg.protogen.annotations.*;
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+package com.netflix.conductor.common.metadata.tasks;
+
+import com.github.vmg.protogen.annotations.ProtoField;
+import com.github.vmg.protogen.annotations.ProtoMessage;
+
 @ProtoMessage
 public class PollData {
 	@ProtoField(id = 1)
+	private
 	String queueName;
 
 	@ProtoField(id = 2)
+	private
 	String domain;
 
 	@ProtoField(id = 3)
+	private
 	String workerId;
 
 	@ProtoField(id = 4)
+	private
 	long lastPollTime;
 	
 	public PollData() {
@@ -102,8 +107,7 @@ public class PollData {
 		} else if (!queueName.equals(other.queueName))
 			return false;
 		if (workerId == null) {
-			if (other.workerId != null)
-				return false;
+			return other.workerId == null;
 		} else if (!workerId.equals(other.workerId))
 			return false;
 		return true;

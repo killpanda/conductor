@@ -1062,16 +1062,18 @@ public class WorkflowExecutor {
         }
     }
 
-    private String getActiveDomain(String taskType, String[] domains) {
+    @VisibleForTesting
+    String getActiveDomain(String taskType, String[] domains) {
         // The domain list has to be ordered.
-        // In sequence check if any worker has polled for last 30 seconds, if so that isSystemTask the Active domain
+        // In sequence check if any worker has polled for last 30 seconds, if so that is the Active domain
+
         return Arrays.stream(domains)
                 .map(domain -> executionDAO.getPollData(taskType, domain.trim()))
                 .filter(Objects::nonNull)
                 .filter(validateLastPolledTime)
                 .findFirst()
                 .map(PollData::getDomain)
-                .orElse(null);
+                .orElse(domains[domains.length - 1].trim());
     }
 
     private long getTaskDuration(long s, Task task) {
